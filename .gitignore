@@ -78,3 +78,5 @@ doc/LuaJIT-2.1/changes.pod
 t/servroot
 __pycache__/
 *.pyc
+/bundle/nginx-1.31.8/objs/
+/bundle/nginx-1.31.8/Makefile
