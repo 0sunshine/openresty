@@ -6,6 +6,7 @@ business database, source transcoding, or model service is used by the tests.
 """
 import argparse
 import collections
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -28,8 +29,10 @@ def command(argv):
     return result
 
 
-def packets(path, interval=None):
+def packets(path, interval=None, raw=False):
     args = [OPTIONS.ffprobe_bin, '-v', 'error']
+    if raw:
+        args += ['-ignore_editlist', '1']
     if interval:
         args += ['-read_intervals', interval]
     args += ['-show_packets', '-show_data_hash', 'sha256', '-show_entries',
@@ -51,7 +54,7 @@ def box(kind, body):
     return struct.pack('>I4s', len(body)+8, kind)+body
 
 
-def movie_metadata(path):
+def read_movie(path):
     # A real sample may be gigabytes; seek past mdat instead of reading it.
     with path.open('rb') as stream:
         while True:
@@ -67,8 +70,12 @@ def movie_metadata(path):
                 assert size-width <= 128*1024*1024
                 movie = stream.read(size-width)
                 assert len(movie) == size-width
-                break
+                return movie
             stream.seek(size-width, 1)
+
+
+def movie_metadata(path):
+    movie = read_movie(path)
     header = next(body for kind, body in boxes(movie) if kind == b'mvhd')
     at = 20 if header[0] else 12
     scale = struct.unpack_from('>I', header, at)[0]
@@ -83,7 +90,9 @@ def movie_metadata(path):
         edit = next((body for k, body in boxes(track) if k == b'edts'), None)
         if edit is None:
             continue
-        table = next(body for k, body in boxes(edit) if k == b'elst')
+        table = next((body for k, body in boxes(edit) if k == b'elst'), None)
+        if table is None:
+            continue
         width = 20 if table[0] else 12
         count = struct.unpack_from('>I', table, 4)[0]
         total = sum(struct.unpack_from('>Q' if table[0] else '>I', table, 8+i*width)[0]
@@ -96,6 +105,43 @@ def movie_duration(path):
     return movie_metadata(path)[0]
 
 
+def apply_movie_edits(path, probe):
+    """Independent ISO timeline check, without demuxer last-packet heuristics."""
+    movie = read_movie(path)
+    mvhd = next(body for kind, body in boxes(movie) if kind == b'mvhd')
+    movie_scale = struct.unpack_from('>I', mvhd, 20 if mvhd[0] else 12)[0]
+    shifts = []
+    for kind, track in boxes(movie):
+        if kind != b'trak':
+            continue
+        mdia = next(body for k, body in boxes(track) if k == b'mdia')
+        mdhd = next(body for k, body in boxes(mdia) if k == b'mdhd')
+        media_scale = struct.unpack_from('>I', mdhd, 20 if mdhd[0] else 12)[0]
+        edit = next((body for k, body in boxes(track) if k == b'edts'), b'')
+        elst = next((body for k, body in boxes(edit) if k == b'elst'), None)
+        shift = 0
+        if elst:
+            lead = 0
+            count = struct.unpack_from('>I', elst, 4)[0]
+            for i in range(count):
+                duration, origin, integer, fraction = struct.unpack_from(
+                    '>Qqhh' if elst[0] else '>Iihh', elst, 8+i*(20 if elst[0] else 12))
+                assert (integer, fraction) == (1, 0)
+                if origin == -1:
+                    lead += duration/movie_scale
+                else:
+                    shift = lead-origin/media_scale
+                    break
+        shifts.append(shift)
+    _, ends = movie_metadata(path)
+    for packet in probe['packets']:
+        track = packet['stream_index']
+        pts = float(packet['pts_time'])+shifts[track]
+        packet['pts_time'] = str(pts)
+        packet['flags'] = 'D' if pts < 0 or pts >= ends[track] else ''
+    return probe
+
+
 def change_movie(source, target, variant):
     """Mutate only metadata; adjust chunk addresses when faststart grows."""
     tops = list(boxes(source.read_bytes()))
@@ -104,7 +150,9 @@ def change_movie(source, target, variant):
     def rewrite(data, adjustment=0):
         output = []
         for kind, body in boxes(data):
-            if kind in {b'moov', b'trak', b'edts', b'mdia', b'minf', b'stbl'}:
+            if kind == b'edts' and variant == 'empty_edts':
+                body = b''
+            elif kind in {b'moov', b'trak', b'edts', b'mdia', b'minf', b'stbl'}:
                 body = rewrite(body, adjustment)
             elif kind == b'elst':
                 count = struct.unpack_from('>I', body, 4)[0]
@@ -119,6 +167,31 @@ def change_movie(source, target, variant):
                     body = body[:4]+struct.pack('>I', count+1)+body[8:]+body[-12:]
                 elif variant == 'truncated':
                     body = body[:4]+struct.pack('>I', count+1)+body[8:]
+                elif variant == 'empty_elst':
+                    body = body[:4]+bytes(4)
+                elif variant == 'unknown_edit_version':
+                    body = b'\2'+body[1:]
+                elif variant == 'invalid_edit_origin':
+                    body = body[:12]+struct.pack('>i', -2)+body[16:]
+            elif kind == b'mdhd' and variant == 'zero_timescale':
+                body = bytearray(body)
+                struct.pack_into('>I', body, 20 if body[0] else 12, 0)
+                body = bytes(body)
+            elif kind == b'stts' and variant == 'wrong_stts_count':
+                body = bytearray(body)
+                struct.pack_into('>I', body, 8, struct.unpack_from('>I', body, 8)[0]+1)
+                body = bytes(body)
+            elif kind in {b'stts', b'ctts'} and variant == 'zero_runs':
+                count = struct.unpack_from('>I', body, 4)[0]
+                middle = 8+(count//2)*8
+                empty = struct.pack('>II', 0, 0 if kind == b'stts' else 0xffffffff)
+                body = body[:4]+struct.pack('>I', count+3)+empty+body[8:middle]+empty+body[middle:]+empty
+            elif kind == b'ctts' and variant in {'long_ctts', 'short_ctts'}:
+                count = struct.unpack_from('>I', body, 4)[0]
+                body = bytearray(body)
+                at = 8+(count-1)*8
+                struct.pack_into('>I', body, at, struct.unpack_from('>I', body, at)[0]+(50 if variant=='long_ctts' else -1))
+                body = bytes(body)
             elif kind == b'stco':
                 count = struct.unpack_from('>I', body, 4)[0]
                 offsets = struct.unpack_from('>'+str(count)+'I', body, 8)
@@ -128,6 +201,8 @@ def change_movie(source, target, variant):
                 offsets = struct.unpack_from('>'+str(count)+'Q', body, 8)
                 body = body[:8]+struct.pack('>'+str(count)+'Q', *(x+adjustment for x in offsets))
             output.append((kind, body))
+            if kind == b'edts' and variant == 'duplicate_edts':
+                output.append((kind, body))
         if variant == 'edit_after_media':
             output.sort(key=lambda row: row[0] == b'edts')
         return b''.join(box(k, v) for k, v in output)
@@ -167,10 +242,13 @@ class MP4Timeline(unittest.TestCase):
                      '-video_track_timescale', '90000', '-movie_timescale', '90000',
                      '-movflags', flags, path])
             cls.fixtures.append(path)
-        for variant in ['version1', 'edit_after_media', 'rate', 'disjoint', 'truncated']:
+        for variant in ['version1', 'edit_after_media', 'empty_edts', 'empty_elst', 'zero_runs',
+                        'rate', 'disjoint', 'truncated', 'long_ctts', 'short_ctts',
+                        'unknown_edit_version', 'invalid_edit_origin', 'zero_timescale',
+                        'wrong_stts_count', 'duplicate_edts']:
             target = cls.work/(variant+'.mp4')
             change_movie(cls.fixtures[0], target, variant)
-            if variant in {'version1', 'edit_after_media'}:
+            if variant in {'version1', 'edit_after_media', 'empty_edts', 'empty_elst', 'zero_runs'}:
                 cls.fixtures.append(target)
 
         with socket.socket() as sock:
@@ -228,20 +306,37 @@ class MP4Timeline(unittest.TestCase):
         with urllib.request.urlopen(urllib.request.Request(url, method=method, headers=headers or {}), timeout=20) as r:
             return r.status, dict(r.headers), r.read()
 
-    def assert_timeline(self, source, clip, start, interval=None):
-        original = packets(str(source), interval)
-        actual = packets(str(clip))
+    def assert_timeline(self, source, clip, start, interval=None, raw=False):
+        self.assert_generated_tables(clip)
+        original = packets(str(source), interval, raw)
+        actual = packets(str(clip), raw=raw)
+        if raw:
+            original = apply_movie_edits(source, original)
+            actual = apply_movie_edits(clip, actual)
         count = collections.Counter(q['data_hash'] for q in original['packets'])
         lookup = {q['data_hash']: q for q in original['packets'] if count[q['data_hash']] == 1}
+        kinds = {stream['index']: stream['codec_type'] for stream in original['streams']}
+        prior = {}
+        for packet in original['packets']:
+            pts = float(packet['pts_time'])
+            if 'D' not in packet.get('flags', '') and pts < start:
+                track = packet['stream_index']
+                prior[track] = max(prior.get(track, float('-inf')), pts)
         matched = collections.Counter()
         for q in actual['packets']:
             before = lookup.get(q['data_hash'])
             if before is None:
                 continue
             delta = float(before['pts_time'])-float(q['pts_time'])
-            self.assertAlmostEqual(delta, start, delta=.00005,
-                                   msg=f'{source.name}: track {q["stream_index"]}, offset {delta}, cut {start}')
-            matched[q['stream_index']] += 1
+            if abs(delta-start) > .00005:
+                # A video sample already on screen at the cut is clipped to
+                # output PTS 0. Other samples keep their common time shift.
+                self.assertEqual(kinds[before['stream_index']], 'video',
+                                 msg=f'{source.name}: track {before["stream_index"]}, delta {delta}, cut {start}')
+                self.assertLess(float(before['pts_time']), start)
+                self.assertAlmostEqual(float(q['pts_time']), 0, delta=.00005)
+                self.assertAlmostEqual(float(before['pts_time']), prior[before['stream_index']], delta=.00005)
+            matched[before['stream_index']] += 1
         self.assertGreater(sum(matched.values()), 0)
         # FFprobe reports a retained media/decode span for some edit lists.
         # Validate the movie interval and edit durations directly instead.
@@ -263,6 +358,25 @@ class MP4Timeline(unittest.TestCase):
             if 'D' not in q.get('flags', ''):
                 self.assertLess(float(q['pts_time']), duration+.00005)
         return dict(matched)
+
+    def assert_generated_tables(self, clip):
+        for kind, track in boxes(read_movie(clip)):
+            if kind != b'trak':
+                continue
+            mdia = next(body for k, body in boxes(track) if k == b'mdia')
+            minf = next(body for k, body in boxes(mdia) if k == b'minf')
+            stbl = next(body for k, body in boxes(minf) if k == b'stbl')
+            tables = dict(boxes(stbl))
+            samples = struct.unpack_from('>I', tables[b'stsz'], 8)[0]
+            for name in (b'stts', b'ctts'):
+                if name not in tables:
+                    continue
+                table = tables[name]
+                entries = struct.unpack_from('>I', table, 4)[0]
+                self.assertEqual(len(table), 8+entries*8)
+                counts = [struct.unpack_from('>I', table, 8+i*8)[0] for i in range(entries)]
+                self.assertTrue(all(counts), f'Empty run emitted in {name}')
+                self.assertEqual(sum(counts), samples, f'Inconsistent sample counts in {name}')
 
     def test_01_packet_timestamps_and_decoding(self):
         for source in self.fixtures:
@@ -301,13 +415,184 @@ class MP4Timeline(unittest.TestCase):
                     self.assert_timeline(source, clip, start)
 
     def test_04_unsupported_edits_fail_without_killing_worker(self):
-        for name in ['rate', 'disjoint', 'truncated']:
+        for name in ['rate', 'disjoint', 'truncated', 'long_ctts', 'short_ctts',
+                     'unknown_edit_version', 'invalid_edit_origin', 'zero_timescale',
+                     'wrong_stts_count', 'duplicate_edts']:
             with self.subTest(name=name):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     self.read(self.base+name+'.mp4?start=1&end=3')
                 self.assertEqual(raised.exception.code, 500)
         self.assertIn('unsupported or invalid mp4 edit list', (self.work/'logs/error.log').read_text())
         self.assertEqual(self.read(self.base+self.fixtures[0].name, method='HEAD')[0], 200)
+
+    def test_06_vfr_held_frame_tail_and_coarse_movie_clock(self):
+        for bframes in (0, 2):
+            source = self.work/f'vfr-{bframes}.mp4'
+            command([OPTIONS.ffmpeg_bin, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                     'testsrc2=size=160x90:rate=25:duration=8', '-f', 'lavfi', '-i',
+                     'anoisesrc=sample_rate=48000:duration=13:seed=731',
+                     '-vf', r'setpts=if(gte(N\,25)\,PTS+5/TB\,PTS)',
+                     '-c:v','libx264','-preset','ultrafast','-g','25','-bf',str(bframes),'-threads:v','1',
+                     '-fps_mode:v','passthrough','-c:a','aac','-video_track_timescale','90000',
+                     '-movie_timescale','90000','-movflags','+faststart',source])
+            expected = command([OPTIONS.ffmpeg_bin,'-v','error','-i',source,'-vf','select=eq(n\\,24)',
+                                '-frames:v','1','-an','-f','md5','-']).stdout
+            for start,end in [(1.131,1.2),(1.131,4.131),(1.131,7),(12.99,13)]:
+                with self.subTest(bframes=bframes,start=start,end=end):
+                    clip=self.work/'vfr-response.mp4'
+                    body=self.read(self.base+source.name+f'?start={start}&end={end}')[2]
+                    clip.write_bytes(body);self.assert_timeline(source,clip,start)
+                    command([OPTIONS.ffmpeg_bin,'-v','error','-xerror','-i',clip,'-f','null','-'])
+                    if start==1.131:
+                        frame=command([OPTIONS.ffmpeg_bin,'-v','error','-i',clip,'-frames:v','1','-an','-f','md5','-']).stdout
+                        self.assertEqual(frame,expected,'The frame active at the cut must remain visible')
+                    if end==1.2:self.assertLess(len(body),source.stat().st_size/2)
+
+    def test_07_empty_track_can_be_cut_again(self):
+        source=self.work/'empty-track.mp4'
+        source.write_bytes(self.read(self.base+self.fixtures[0].name+'?start=0&end=0.2')[2])
+        clip=self.work/'empty-track-response.mp4'
+        clip.write_bytes(self.read(self.base+source.name+'?start=0.01&end=0.1')[2])
+        self.assertAlmostEqual(movie_duration(clip),.09,delta=.00005)
+        self.assert_generated_tables(clip)
+
+    def test_08_multiple_audio_tracks_and_short_video(self):
+        source=self.work/'short-video-multiple-audio.mp4'
+        command([OPTIONS.ffmpeg_bin,'-v','error','-y','-f','lavfi','-i',
+                 'testsrc2=size=160x90:rate=30000/1001:duration=3',
+                 '-f','lavfi','-i','anoisesrc=sample_rate=48000:duration=8:seed=731',
+                 '-f','lavfi','-i','anoisesrc=sample_rate=44100:duration=8:seed=132',
+                 '-filter_complex','[2:a]asetpts=PTS+0.673/TB[delayed]',
+                 '-map','0:v','-map','1:a','-map','[delayed]',
+                 '-c:v','libx264','-preset','ultrafast','-g','25','-bf','3','-threads:v','1',
+                 '-c:a','aac','-video_track_timescale','90000','-movie_timescale','1000',
+                 '-movflags','+faststart',source])
+        for start,end in [(0,.2),(.137,2.893),(2.99,3),(3.5,4.5),(7.99,8),(8.2,8.5)]:
+            with self.subTest(start=start,end=end):
+                clip=self.work/f'multiple-audio-response-{start}.mp4'
+                clip.write_bytes(self.read(self.base+source.name+f'?start={start}&end={end}')[2])
+                # FFmpeg's MOV demuxer substitutes edit duration for the last
+                # packet's duration. A 10 ms tail inside a 21 ms AAC packet can
+                # then be incorrectly discarded. Check that case directly
+                # against raw packet clocks and the ISO edit list instead.
+                matched=self.assert_timeline(source,clip,start,raw=(start==7.99))
+                if start>.673:self.assertGreater(matched.get(2,0),0)
+                command([OPTIONS.ffmpeg_bin,'-v','error','-xerror','-i',clip,
+                         '-map','0:v?','-map','0:a?','-f','null','-'])
+
+    def test_09_concurrent_requests_do_not_share_modified_tables(self):
+        source = self.fixtures[0]
+        urls = [self.base+source.name+f'?start={start}&end={start+2}'
+                for start in (.137, .641, 1.131, 2.333)]
+        expected = {url: hashlib.sha256(self.read(url)[2]).digest() for url in urls}
+
+        def request(index):
+            if index % 5 == 0:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.read(self.base+'long_ctts.mp4?start=1&end=3')
+                self.assertEqual(raised.exception.code, 500)
+            else:
+                url = urls[index % len(urls)]
+                self.assertEqual(hashlib.sha256(self.read(url)[2]).digest(), expected[url])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(request, range(80)))
+        log = (self.work/'logs/error.log').read_text()
+        self.assertNotRegex(log, r'exited on signal|AddressSanitizer|runtime error:')
+
+    @unittest.skipIf(os.name == 'nt', 'requires sparse-file support without allocating 4 GiB')
+    def test_10_co64_offsets_above_four_gibibytes(self):
+        source = self.fixtures[0]
+        tops = list(boxes(source.read_bytes()))
+        movie = next(body for kind, body in tops if kind == b'moov')
+        payload = next(body for kind, body in tops if kind == b'mdat')
+        old_offset = 0
+        for kind, body in tops:
+            if kind == b'mdat':
+                old_offset += 8
+                break
+            old_offset += len(body)+8
+
+        def rewrite(data, adjustment):
+            output = []
+            for kind, body in boxes(data):
+                if kind in {b'moov', b'trak', b'mdia', b'minf', b'stbl'}:
+                    body = rewrite(body, adjustment)
+                elif kind == b'stco':
+                    count = struct.unpack_from('>I', body, 4)[0]
+                    offsets = struct.unpack_from('>'+str(count)+'I', body, 8)
+                    kind = b'co64'
+                    body = body[:8]+struct.pack('>'+str(count)+'Q', *(x+adjustment for x in offsets))
+                output.append(box(kind, body))
+            return b''.join(output)
+
+        before = b''.join(box(kind, body) for kind, body in tops if kind not in {b'moov', b'mdat'})
+        gap = 1 << 32
+        new_offset = len(before)+len(box(b'moov', rewrite(movie, 0)))+16+gap
+        target = self.work/'large-co64.mp4'
+        with target.open('wb') as stream:
+            stream.write(before+box(b'moov', rewrite(movie, new_offset-old_offset)))
+            stream.write(struct.pack('>I4sQ', 1, b'mdat', 16+gap+len(payload)))
+            stream.seek(gap, 1)
+            stream.write(payload)
+        self.assertGreater(target.stat().st_size, gap)
+        clip = self.work/'large-co64-response.mp4'
+        clip.write_bytes(self.read(self.base+target.name+'?start=1.131&end=4.131')[2])
+        self.assert_timeline(target, clip, 1.131)
+        command([OPTIONS.ffmpeg_bin, '-v', 'error', '-xerror', '-i', clip, '-f', 'null', '-'])
+
+    def test_11_keyframe_preroll_above_uint32_ticks(self):
+        # A valid video-only long-GOP clock: no large media allocation or
+        # real-time wait is needed to exercise a >32-bit keyframe prefix.
+        tops = list(boxes(self.fixtures[2].read_bytes()))
+        factor = 60000
+
+        def rewrite(data, adjustment=0):
+            output = []
+            for kind, body in boxes(data):
+                if kind == b'trak':
+                    mdia = next(b for k, b in boxes(body) if k == b'mdia')
+                    handler = next(b for k, b in boxes(mdia) if k == b'hdlr')
+                    if handler[8:12] != b'vide':
+                        continue
+                if kind in {b'moov', b'trak', b'edts', b'mdia', b'minf', b'stbl'}:
+                    body = rewrite(body, adjustment)
+                elif kind in {b'mvhd', b'mdhd'}:
+                    assert body[0] == 0
+                    created, modified, scale, duration = struct.unpack_from('>4I', body, 4)
+                    body = b'\1'+body[1:4]+struct.pack('>QQIQ', created, modified, scale, duration*factor)+body[20:]
+                elif kind == b'tkhd':
+                    assert body[0] == 0
+                    created, modified, track, reserved, duration = struct.unpack_from('>5I', body, 4)
+                    body = b'\1'+body[1:4]+struct.pack('>QQIIQ', created, modified, track, reserved, duration*factor)+body[24:]
+                elif kind == b'elst':
+                    count = struct.unpack_from('>I', body, 4)[0]
+                    rows = [struct.unpack_from('>Iihh', body, 8+i*12) for i in range(count)]
+                    body = b'\1'+body[1:8]+b''.join(struct.pack('>Qqhh', duration*factor,
+                        origin*factor if origin >= 0 else origin, integer, fraction)
+                        for duration, origin, integer, fraction in rows)
+                elif kind == b'stts':
+                    body = bytearray(body)
+                    for at in range(12, len(body), 8):
+                        struct.pack_into('>I', body, at, struct.unpack_from('>I', body, at)[0]*factor)
+                    body = bytes(body)
+                elif kind == b'stco':
+                    count = struct.unpack_from('>I', body, 4)[0]
+                    offsets = struct.unpack_from('>'+str(count)+'I', body, 8)
+                    body = body[:8]+struct.pack('>'+str(count)+'I', *(x+adjustment for x in offsets))
+                output.append(box(kind, body))
+            return b''.join(output)
+
+        movie = next(body for kind, body in tops if kind == b'moov')
+        changed = rewrite(movie)
+        changed = rewrite(movie, len(changed)-len(movie))
+        source = self.work/'long-gop-clock.mp4'
+        source.write_bytes(b''.join(box(kind, changed if kind == b'moov' else body) for kind, body in tops))
+        start, end = .953*factor, 1.753*factor
+        clip = self.work/'long-gop-clock-response.mp4'
+        clip.write_bytes(self.read(self.base+source.name+f'?start={start}&end={end}')[2])
+        self.assert_timeline(source, clip, start)
+        self.assertAlmostEqual(movie_duration(clip), end-start, delta=.00005)
 
     @unittest.skipUnless(os.environ.get('OPENRESTY_MP4_REAL_SOURCE'), 'optional real media copy')
     def test_05_real_media(self):

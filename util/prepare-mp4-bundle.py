@@ -61,6 +61,9 @@ def prepare(work):
             cached = destination/'bundle'/NGINX/relative
             if not cached.is_file() or digest(cached) != checksum:
                 raise RuntimeError(f'Cached Nginx source differs from branch: {cached}')
+        cached = destination/'util/build-win32.sh'
+        if not cached.is_file() or digest(cached) != digest(root/'util/build-win32.sh'):
+            raise RuntimeError(f'Cached Windows build script differs from branch: {cached}')
         return destination
     if destination.exists():
         raise RuntimeError(f'Unrecognized existing build directory: {destination}')

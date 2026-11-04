@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -71,6 +72,43 @@ class PrepareBundle(unittest.TestCase):
         archive.write_bytes(b'invalid release')
         with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
             self.prepare()
+
+    def test_modified_cached_windows_build_script_is_rejected(self):
+        result = self.prepare()
+        (result/'util/build-win32.sh').write_text('unexpected cache edit')
+        with self.assertRaisesRegex(RuntimeError, 'Cached Windows build script differs'):
+            self.prepare()
+
+    def test_in_tree_build_products_do_not_enter_source_bundle(self):
+        tree = self.checkout/'bundle'/self.module.NGINX
+        (tree/'objs').mkdir()
+        (tree/'objs/nginx').write_bytes(b'stale executable')
+        (tree/'Makefile').write_text('stale build configuration')
+        result = self.prepare()/'bundle'/self.module.NGINX
+        self.assertFalse((result/'objs').exists())
+        self.assertFalse((result/'Makefile').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'upstream mirror tool requires a Unix shell')
+    def test_mirror_uses_clean_direct_source(self):
+        tree = self.checkout/'bundle'/self.module.NGINX
+        (tree/'objs').mkdir()
+        (tree/'objs/nginx').write_bytes(b'stale executable')
+        (tree/'Makefile').write_text('stale build configuration')
+        shutil.copy2(ROOT/'util/ver', self.checkout/'util/ver')
+        patch_dir = self.checkout/'patches/nginx/1.31.8'
+        patch_dir.mkdir(parents=True)
+        (patch_dir/'nginx-1.31.8-no_pool.patch').write_text('')
+        # Stop before dependency downloads; exercise the actual mirror stage.
+        prefix = (ROOT/'util/mirror-tarballs').read_text().split('ver=0.65', 1)[0]
+        script = self.checkout/'util/mirror-prefix'
+        script.write_text(prefix)
+        subprocess.run(['bash', str(script)], cwd=self.checkout, check=True,
+                       capture_output=True, timeout=30)
+        result = self.checkout/f'openresty-{self.module.VERSION}/bundle'/self.module.NGINX
+        self.assertFalse((result/'objs').exists())
+        self.assertFalse((result/'Makefile').exists())
+        for relative, source, _ in self.module.source_files(tree):
+            self.assertEqual((result/relative).read_bytes(), source.read_bytes())
 
 
 if __name__ == '__main__':

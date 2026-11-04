@@ -54,7 +54,9 @@ if [ ! -f "$root/bundle/nginx-$ver/src/core/nginx.h" ]; then
 fi
 
 echo "$info_txt using branch-owned nginx-$ver source"
-cp -R "$root/bundle/nginx-$ver" ./ || exit 1
+(set -o pipefail
+ tar -C "$root/bundle" --exclude="nginx-$ver/objs" \
+     --exclude="nginx-$ver/Makefile" -cf - "nginx-$ver" | tar -xf -) || exit 1
 
 cp $root/patches/nginx/$main_ver/nginx-$main_ver-no_pool.patch ./nginx-no_pool.patch || exit 1
 sed $"s/NGINX_VERSION \".unknown/NGINX_VERSION \".$minor_ver/" \
