@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Prepare a checksum-pinned release with this fork's MP4 patch applied.
+"""Prepare OpenResty using the Nginx source maintained directly in this branch.
 
-The Git repository contains OpenResty's bundle recipe and patches, not its
-generated nginx source tree.  This shortcut uses the matching official bundle
-so Linux and native Windows builds do not need every bundle-maintainer tool.
+The matching official archive supplies the other OpenResty components. Its
+Nginx tree is excluded: the complete branch-owned tree is the build input.
 """
 import argparse
 import hashlib
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import shutil
-import subprocess
-import sys
 import tarfile
 import tempfile
 import time
 import urllib.request
 
 VERSION = '1.31.8.1'
+NGINX = 'nginx-1.31.8'
 SHA256 = 'b569c63b420f80a4ac8466f2deffe73ed93ab760026532e039c3658409a997f4'
 
 
@@ -28,17 +27,40 @@ def digest(path):
     return h.hexdigest()
 
 
+def source_files(directory):
+    if directory.is_symlink() or not (directory/'src/core/nginx.h').is_file():
+        raise RuntimeError(f'Missing branch-owned Nginx source: {directory}')
+    files = []
+    for path in sorted(directory.rglob('*')):
+        relative = path.relative_to(directory)
+        if relative.parts[0] == 'objs' or relative.as_posix() == 'Makefile':
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f'Nginx source must be a regular file: {path}')
+        if path.is_file():
+            files.append((relative, path, digest(path)))
+    return files
+
+
 def prepare(work):
     root = Path(__file__).resolve().parents[1]
-    patch = root/'patches/nginx/1.31.8/nginx-1.31.8-mp4-timeline.patch'
+    files = source_files(root/'bundle'/NGINX)
     fingerprint = hashlib.sha256()
-    for path in [patch, root/'util/build-win32.sh']:
-        fingerprint.update(path.read_bytes())
+    fingerprint.update(f'{VERSION}\0{os.name}\0'.encode())
+    inputs = [(Path('bundle')/NGINX/relative, checksum) for relative, _, checksum in files]
+    inputs += [(Path('util')/name, digest(root/'util'/name))
+               for name in ['prepare-mp4-bundle.py', 'build-win32.sh']]
+    for name, checksum in inputs:
+        fingerprint.update(name.as_posix().encode()+b'\0'+checksum.encode()+b'\0')
     identity = fingerprint.hexdigest()
     work.mkdir(parents=True, exist_ok=True)
     destination = work/f'openresty-{VERSION}-langslice-{identity[:16]}'
     marker = destination/'.langslice-mp4-source'
     if marker.is_file() and marker.read_text() == identity:
+        for relative, _, checksum in files:
+            cached = destination/'bundle'/NGINX/relative
+            if not cached.is_file() or digest(cached) != checksum:
+                raise RuntimeError(f'Cached Nginx source differs from branch: {cached}')
         return destination
     if destination.exists():
         raise RuntimeError(f'Unrecognized existing build directory: {destination}')
@@ -67,11 +89,25 @@ def prepare(work):
     with tempfile.TemporaryDirectory(prefix='.prepare-mp4-', dir=work) as directory:
         staging = Path(directory)
         with tarfile.open(archive) as source:
-            source.extractall(staging, filter='data')
+            excluded = f'openresty-{VERSION}/bundle/{NGINX}'
+            members = []
+            for member in source.getmembers():
+                if member.name.rstrip('/') == excluded or member.name.startswith(excluded+'/'):
+                    continue
+                parts = PurePosixPath(member.name).parts
+                # Dependency test fixtures contain DOS device names such as
+                # t/openssl/aux. They are not inputs to native Windows builds.
+                if os.name == 'nt' and len(parts) > 3 and parts[1] == 'bundle' and 't' in parts[3:]:
+                    continue
+                members.append(member)
+            source.extractall(staging, members=members, filter='data')
         bundle = staging/f'openresty-{VERSION}'
-        subprocess.run(['patch', '--batch', '--forward', '-p1', '-i', str(patch)],
-                       cwd=bundle/'bundle/nginx-1.31.8', check=True,
-                       stdout=sys.stderr, stderr=sys.stderr)
+        for relative, path, checksum in files:
+            target = bundle/'bundle'/NGINX/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            if digest(target) != checksum:
+                raise RuntimeError(f'Nginx source changed while preparing: {path}')
         (bundle/'util').mkdir(exist_ok=True)
         shutil.copyfile(root/'util/build-win32.sh', bundle/'util/build-win32.sh')
         (bundle/'.langslice-mp4-source').write_text(identity)

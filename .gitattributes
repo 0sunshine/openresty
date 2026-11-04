@@ -4,3 +4,7 @@ clients/* linguist-language=Text
 * linguist-language=C
 # Keep the imported release sources byte-for-byte identical on every platform.
 /bundle/nginx-1.31.8/** -text
+/util/prepare-mp4-bundle.py text eol=lf
+/util/build-win32.sh text eol=lf
+/util/mirror-tarballs text eol=lf
+/t/*.py text eol=lf

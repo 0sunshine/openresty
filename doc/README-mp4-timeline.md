@@ -10,11 +10,11 @@
 
 支持版本 0/1 编辑列表、前导空编辑和一个连续、速率为 1 的媒体编辑，以及有符号 CTTS。STTS/CTTS 按压缩后的 run 表合并扫描，不展开成逐帧表。复杂的重复编辑、变速、停帧、多段可见编辑及损坏编辑列表明确返回错误并记录日志，不静默丢弃偏移。
 
-补丁位于 `patches/nginx/1.31.8/nginx-1.31.8-mp4-timeline.patch`。OpenResty Git 仓库保存打包配方而非生成后的 Nginx 源码；`util/mirror-tarballs` 已登记该补丁。
+实现直接位于 `bundle/nginx-1.31.8/src/http/modules/ngx_http_mp4_module.c`，完整 Nginx 源码随本分支维护，来源见 `bundle/README.md`。功能修改直接提交为 C 文件的差异。`util/mirror-tarballs` 直接使用分支源码树。
 
 ## 可复现构建
 
-用 Python 准备固定摘要的官方源码包，再应用当前分支补丁：
+用 Python 准备构建目录。Nginx 使用当前分支中的完整源码树，其他组件来自固定摘要的官方源码包：
 
 ```sh
 python3.12 util/prepare-mp4-bundle.py --work-dir /absolute/build
@@ -25,13 +25,14 @@ make -j4
 make install
 ```
 
-准备工具需要 GNU patch，校验官方 OpenResty 1.31.8.1 源码包 SHA-256：`b569c63b420f80a4ac8466f2deffe73ed93ab760026532e039c3658409a997f4`。生成目录按补丁及 Windows 构建脚本内容隔离缓存。
+准备工具校验官方 OpenResty 1.31.8.1 源码包 SHA-256：`b569c63b420f80a4ac8466f2deffe73ed93ab760026532e039c3658409a997f4`，排除其中的 Nginx 目录，复制分支中维护的完整源码。此步骤不调用 patch。生成目录按平台、全部 Nginx 源文件、准备工具及 Windows 构建脚本的内容隔离缓存；命中缓存后也校验 Nginx 文件内容。Linux 默认构建无需 GNU patch。Windows 准备时省略依赖组件的 `t/` 测试目录，避免其中的 `aux` 等 Windows 保留名；编译所需库文件及完整 Nginx 源码均保留。
 
-Windows 在原生 MSYS2 MINGW64 中运行生成目录下的 `bash util/build-win32.sh`，使用本版本的 PCRE2 10.49、zlib 1.3.2、OpenSSL 3.5.9。选择面向 Server 2012 的编译器和运行库，禁止把近期 MSYS2 的预编译依赖视为已兼容旧系统。此补丁没有新增平台 API，但 **Windows Server 2012 尚未实机验收**；须验证启动、Lua、MP4、HEAD/Range、SSL 和实际片源后再发布。Windows 不使用 Linux 线程池配置。
+Windows 在原生 MSYS2 MINGW64 中运行生成目录下的 `bash util/build-win32.sh`，使用本版本的 PCRE2 10.49、zlib 1.3.2、OpenSSL 3.5.9，依赖构建沿用上游脚本。选择面向 Server 2012 的编译器和运行库，禁止把近期 MSYS2 的预编译依赖视为已兼容旧系统。MP4 修复没有新增平台 API，但 **Windows Server 2012 尚未实机验收**；须验证启动、Lua、MP4、HEAD/Range、SSL 和实际片源后再发布。Windows 不使用 Linux 线程池配置。
 
 ## 回归
 
 ```sh
+OPENRESTY_RELEASE_ARCHIVE=/absolute/openresty-1.31.8.1.tar.gz python3.12 t/prepare_bundle.py
 python3.12 t/mp4_timeline.py \
     --nginx-bin /absolute/runtime/nginx/sbin/nginx \
     --ffmpeg-bin /absolute/ffmpeg --ffprobe-bin /absolute/ffprobe \
@@ -42,4 +43,4 @@ python3.12 t/mp4_timeline.py \
 
 通过 `OPENRESTY_MP4_REAL_SOURCE`、`OPENRESTY_MP4_REAL_START`、`OPENRESTY_MP4_REAL_END` 可增加现场素材的独立副本。测试按压缩数据包 SHA-256 匹配原片与片段，并检查所有匹配包的共同 PTS 平移量，不用播放器主观观感代替时间轴验证。
 
-接入时直接传原片 movie 时间，移除针对旧模块忽略编辑列表的单轨偏移补偿。所有负责 MP4 虚拟截取的网关应使用同一补丁版本。
+接入时直接传原片 movie 时间，移除针对旧模块忽略编辑列表的单轨偏移补偿。所有负责 MP4 虚拟截取的网关应使用同一修复版本。
