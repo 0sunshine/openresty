@@ -27,6 +27,7 @@ cd ../../..
 ./configure \
     --with-cc=gcc \
     --platform=msys \
+    --build=langslice-mp4-timeline-v1 \
     --prefix= \
     --with-cc-opt='-DFD_SETSIZE=1024' \
     --sbin-path=nginx.exe \
