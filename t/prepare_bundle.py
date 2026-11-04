@@ -21,6 +21,8 @@ class PrepareBundle(unittest.TestCase):
         self.base = Path(temporary.name)
         self.checkout = self.base/'checkout'
         shutil.copytree(ROOT/'bundle', self.checkout/'bundle')
+        shutil.copytree(ROOT/'langslice', self.checkout/'langslice',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         (self.checkout/'util').mkdir()
         for name in ['prepare-mp4-bundle.py', 'build-win32.sh']:
             shutil.copy2(ROOT/'util'/name, self.checkout/'util'/name)
@@ -77,6 +79,18 @@ class PrepareBundle(unittest.TestCase):
         result = self.prepare()
         (result/'util/build-win32.sh').write_text('unexpected cache edit')
         with self.assertRaisesRegex(RuntimeError, 'Cached Windows build script differs'):
+            self.prepare()
+
+    def test_gateway_edits_select_a_new_bundle_and_cache_is_verified(self):
+        first = self.prepare()
+        source = self.checkout/'langslice/reader.lua'
+        source.write_bytes(source.read_bytes()+b'\n-- changed gateway source\n')
+        second = self.prepare()
+        self.assertNotEqual(first, second)
+        cached = second/'langslice/reader.lua'
+        self.assertEqual(cached.read_bytes(), source.read_bytes())
+        cached.write_bytes(b'bad cached gateway script')
+        with self.assertRaisesRegex(RuntimeError, 'Cached gateway source differs'):
             self.prepare()
 
     def test_in_tree_build_products_do_not_enter_source_bundle(self):

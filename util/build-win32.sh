@@ -27,7 +27,7 @@ cd ../../..
 ./configure \
     --with-cc=gcc \
     --platform=msys \
-    --build=langslice-mp4-timeline-v1 \
+    --build="langslice-mp4-timeline-v1-$(cat langslice/VERSION)" \
     --prefix= \
     --with-cc-opt='-DFD_SETSIZE=1024' \
     --sbin-path=nginx.exe \
@@ -63,5 +63,6 @@ cd ../../..
     -j$JOBS || exit 1
 
 make -j$JOBS || exit 1
-exec make install
+make install || exit 1
+"${BUILD_PYTHON:-python3}" langslice/install-runtime.py --prefix "$PWD"
 

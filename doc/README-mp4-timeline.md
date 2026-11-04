@@ -12,6 +12,8 @@
 
 实现直接位于 `bundle/nginx-1.31.8/src/http/modules/ngx_http_mp4_module.c`，完整 Nginx 源码随本分支维护，来源见 `bundle/README.md`。功能修改直接提交为 C 文件的差异。`util/mirror-tarballs` 直接使用分支源码树。
 
+各角色的配置生成器、Lua 读取脚本和构建入口统一维护在 [langslice/](../langslice/README.md)。发布使用该目录的构建入口，将二进制和配套脚本作为同一固定版本交付。
+
 ## 可复现构建
 
 用 Python 准备构建目录。Nginx 使用当前分支中的完整源码树，其他组件来自固定摘要的官方源码包：

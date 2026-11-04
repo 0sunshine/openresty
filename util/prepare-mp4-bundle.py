@@ -45,11 +45,20 @@ def source_files(directory):
 def prepare(work):
     root = Path(__file__).resolve().parents[1]
     files = source_files(root/'bundle'/NGINX)
+    gateway = []
+    for path in sorted((root/'langslice').iterdir()):
+        if path.is_symlink():
+            raise RuntimeError(f'Gateway source must be a regular file: {path}')
+        if path.is_file() and path.suffix not in {'.pyc', '.pyo'}:
+            gateway.append((path.relative_to(root), path, digest(path)))
+    if not any(relative.name == 'VERSION' for relative, _, _ in gateway):
+        raise RuntimeError('Missing branch-owned gateway assets')
     fingerprint = hashlib.sha256()
     fingerprint.update(f'{VERSION}\0{os.name}\0'.encode())
     inputs = [(Path('bundle')/NGINX/relative, checksum) for relative, _, checksum in files]
     inputs += [(Path('util')/name, digest(root/'util'/name))
                for name in ['prepare-mp4-bundle.py', 'build-win32.sh']]
+    inputs += [(relative, checksum) for relative, _, checksum in gateway]
     for name, checksum in inputs:
         fingerprint.update(name.as_posix().encode()+b'\0'+checksum.encode()+b'\0')
     identity = fingerprint.hexdigest()
@@ -64,6 +73,10 @@ def prepare(work):
         cached = destination/'util/build-win32.sh'
         if not cached.is_file() or digest(cached) != digest(root/'util/build-win32.sh'):
             raise RuntimeError(f'Cached Windows build script differs from branch: {cached}')
+        for relative, _, checksum in gateway:
+            cached = destination/relative
+            if not cached.is_file() or digest(cached) != checksum:
+                raise RuntimeError(f'Cached gateway source differs from branch: {cached}')
         return destination
     if destination.exists():
         raise RuntimeError(f'Unrecognized existing build directory: {destination}')
@@ -113,6 +126,12 @@ def prepare(work):
                 raise RuntimeError(f'Nginx source changed while preparing: {path}')
         (bundle/'util').mkdir(exist_ok=True)
         shutil.copyfile(root/'util/build-win32.sh', bundle/'util/build-win32.sh')
+        for relative, path, checksum in gateway:
+            target = bundle/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            if digest(target) != checksum:
+                raise RuntimeError(f'Gateway source changed while preparing: {path}')
         (bundle/'.langslice-mp4-source').write_text(identity)
         bundle.replace(destination)
     return destination
